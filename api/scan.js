@@ -1,10 +1,16 @@
 export default async function handler(req, res) {
-  // CORS
+  // CORS — autorise toutes les origines
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
 
-  if (req.method === "OPTIONS") return res.status(200).end();
+  // Preflight OPTIONS — Vercel doit répondre 200 immédiatement
+  if (req.method === "OPTIONS") {
+    res.status(200).end();
+    return;
+  }
+
   if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
 
   const { image, mediaType } = req.body;
