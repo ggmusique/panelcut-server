@@ -1,16 +1,10 @@
 export default async function handler(req, res) {
-  // CORS — autorise toutes les origines
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
 
-  // Preflight OPTIONS — Vercel doit répondre 200 immédiatement
-  if (req.method === "OPTIONS") {
-    res.status(200).end();
-    return;
-  }
-
+  if (req.method === "OPTIONS") { res.status(200).end(); return; }
   if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
 
   const { image, mediaType } = req.body;
@@ -29,31 +23,46 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 1024,
+        max_tokens: 2048,
         messages: [{
           role: "user",
           content: [
             {
               type: "image",
-              source: {
-                type: "base64",
-                media_type: mediaType || "image/jpeg",
-                data: image
-              }
+              source: { type: "base64", media_type: mediaType || "image/jpeg", data: image }
             },
             {
               type: "text",
-              text: `Tu es un expert menuisier. Analyse ce plan de découpe et extrait toutes les pièces.
-Retourne UNIQUEMENT ce JSON valide, rien d'autre, pas de backticks, pas de texte avant ou après :
-{"pieces":[{"name":"Montant","length":226.4,"height":58,"qty":4}]}
+              text: `Tu es un expert menuisier. Analyse ce plan de découpe de meuble.
 
-Règles :
-- Dimensions en cm
-- length = plus grande dimension de la pièce
-- height = plus petite dimension de la pièce  
-- qty = quantité (cherche annotations x4, 4P, (4), ×4... sinon mets 1)
-- name = type de pièce (montant, tablette, étagère, traverse, dos, fond, côté, pied...)
-- Extrait TOUTES les pièces visibles`
+Retourne UNIQUEMENT ce JSON valide, rien d'autre, pas de backticks :
+
+{
+  "pieces": [
+    {"name": "Montant", "length": 226.4, "height": 58, "qty": 4}
+  ],
+  "cabinet": {
+    "width": 378,
+    "height": 230,
+    "depth": 60,
+    "plinth": 8,
+    "modules": [75.6, 75.6, 75.6, 75.6, 75.6]
+  }
+}
+
+RÈGLES PIÈCES :
+- dimensions en cm, length = grande dim, height = petite dim
+- qty = quantité (cherche x4, 4P, ×4... sinon 1)
+- name = type (montant, tablette, traverse, dos, fond, côté, étagère...)
+- Extrait TOUTES les pièces visibles
+
+RÈGLES CABINET (dimensions globales du meuble) :
+- width = largeur totale du meuble en cm
+- height = hauteur totale en cm  
+- depth = profondeur en cm (si visible, sinon 60)
+- plinth = hauteur de la plinthe en cm (si visible, sinon 0)
+- modules = liste des largeurs de chaque corps/module en cm (ex: [75.6, 75.6, 75.6])
+- Si les dimensions globales ne sont pas lisibles, mets width:0 height:0 depth:0`
             }
           ]
         }]
@@ -86,7 +95,9 @@ Règles :
       }))
       .filter(p => p.length > 0 && p.height > 0);
 
-    res.json({ pieces });
+    const cabinet = parsed.cabinet || null;
+
+    res.json({ pieces, cabinet });
 
   } catch (err) {
     console.error("Scan error:", err.message);
