@@ -23,7 +23,7 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 2048,
+        max_tokens: 4096,
         messages: [{
           role: "user",
           content: [
@@ -33,36 +33,69 @@ export default async function handler(req, res) {
             },
             {
               type: "text",
-              text: `Tu es un expert menuisier. Analyse ce plan de découpe de meuble.
+              text: `Tu es un expert menuisier-ébéniste et dessinateur industriel.
+Analyse ce plan de meuble (croquis à main levée, plan technique ou photo).
 
-Retourne UNIQUEMENT ce JSON valide, rien d'autre, pas de backticks :
+Retourne UNIQUEMENT ce JSON valide, sans backticks, sans texte autour :
 
 {
   "pieces": [
-    {"name": "Montant", "length": 226.4, "height": 58, "qty": 4}
+    {"name": "Montant G", "length": 226.4, "height": 58, "qty": 2}
   ],
   "cabinet": {
-    "width": 378,
-    "height": 230,
-    "depth": 60,
+    "type": "armoire",
+    "width": 120,
+    "height": 220,
+    "depth": 58,
+    "thickness": 1.8,
     "plinth": 8,
-    "modules": [75.6, 75.6, 75.6, 75.6, 75.6]
+    "modules": [
+      { "x": 0, "width": 60, "shelves": 3, "doors": 1, "drawers": 0 },
+      { "x": 60, "width": 60, "shelves": 2, "doors": 0, "drawers": 3 }
+    ],
+    "panels": [
+      { "role": "side",    "name": "Côté G",    "w": 58,  "h": 220, "qty": 1, "x": 0,    "y": 0, "z": 0 },
+      { "role": "side",    "name": "Côté D",    "w": 58,  "h": 220, "qty": 1, "x": 120,  "y": 0, "z": 0 },
+      { "role": "back",    "name": "Fond",      "w": 120, "h": 220, "qty": 1, "x": 0,    "y": 0, "z": 58 },
+      { "role": "top",     "name": "Dessus",    "w": 120, "h": 58,  "qty": 1, "x": 0,    "y": 220,"z": 0 },
+      { "role": "bottom",  "name": "Fond bas",  "w": 120, "h": 58,  "qty": 1, "x": 0,    "y": 8,  "z": 0 },
+      { "role": "shelf",   "name": "Tablette",  "w": 116, "h": 58,  "qty": 3, "x": 2,    "y": 60, "z": 0 },
+      { "role": "divider", "name": "Séparation","w": 58,  "h": 200, "qty": 1, "x": 60,   "y": 8,  "z": 0 }
+    ]
   }
 }
 
-RÈGLES PIÈCES :
-- dimensions en cm, length = grande dim, height = petite dim
-- qty = quantité (cherche x4, 4P, ×4... sinon 1)
-- name = type (montant, tablette, traverse, dos, fond, côté, étagère...)
-- Extrait TOUTES les pièces visibles
+RÈGLES STRICTES :
 
-RÈGLES CABINET (dimensions globales du meuble) :
-- width = largeur totale du meuble en cm
-- height = hauteur totale en cm  
-- depth = profondeur en cm (si visible, sinon 60)
-- plinth = hauteur de la plinthe en cm (si visible, sinon 0)
-- modules = liste des largeurs de chaque corps/module en cm (ex: [75.6, 75.6, 75.6])
-- Si les dimensions globales ne sont pas lisibles, mets width:0 height:0 depth:0`
+== PIECES (liste pour la découpe) ==
+- dimensions en cm, length = grande dimension, height = petite dimension
+- qty = quantité réelle (lis x4, 4P, ×4, sinon 1)
+- name = type précis (Montant G/D, Tablette, Traverse H/B, Fond, Côté G/D, Étagère, Séparation...)
+- Extrait TOUTES les pièces visibles sur le plan
+
+== CABINET (modèle structuré du meuble entier) ==
+- type : "armoire" | "bibliothèque" | "cuisine" | "buffet" | "meuble-tv" | "dressing" | "autre"
+- width, height, depth : dimensions globales en cm (0 si illisible)
+- thickness : épaisseur des panneaux en cm (défaut 1.8)
+- plinth : hauteur de la plinthe en cm (0 si absente)
+- modules : liste des corps/colonnes du meuble, chacun avec :
+    x = position X de départ en cm depuis la gauche
+    width = largeur en cm
+    shelves = nombre de tablettes intérieures
+    doors = nombre de portes (0 si aucune)
+    drawers = nombre de tiroirs (0 si aucun)
+- panels : liste COMPLÈTE des panneaux structurels avec :
+    role = "side" | "back" | "top" | "bottom" | "shelf" | "divider" | "door" | "drawer_front"
+    name = nom affiché
+    w = largeur en cm
+    h = hauteur en cm
+    qty = quantité
+    x, y, z = position 3D en cm dans le repère du meuble (origine = coin bas-gauche-avant)
+        x = position gauche-droite
+        y = position bas-haut (0 = sol, plinth inclu)
+        z = position avant-arrière (0 = face avant, depth = fond)
+- Si tu ne peux pas lire une valeur, mets 0 pour les nombres et "autre" pour le type
+- Ne jamais omettre le champ cabinet même si vide : retourne cabinet avec width:0 si illisible`
             }
           ]
         }]
@@ -95,7 +128,26 @@ RÈGLES CABINET (dimensions globales du meuble) :
       }))
       .filter(p => p.length > 0 && p.height > 0);
 
-    const cabinet = parsed.cabinet || null;
+    const rawCab = parsed.cabinet || {};
+    const cabinet = {
+      type:      rawCab.type      || "autre",
+      width:     parseFloat(rawCab.width)     || 0,
+      height:    parseFloat(rawCab.height)    || 0,
+      depth:     parseFloat(rawCab.depth)     || 60,
+      thickness: parseFloat(rawCab.thickness) || 1.8,
+      plinth:    parseFloat(rawCab.plinth)    || 0,
+      modules:   Array.isArray(rawCab.modules) ? rawCab.modules : [],
+      panels:    Array.isArray(rawCab.panels)  ? rawCab.panels.map(p => ({
+        role: p.role || "side",
+        name: String(p.name || "").slice(0, 40),
+        w:    parseFloat(p.w) || 0,
+        h:    parseFloat(p.h) || 0,
+        qty:  Math.max(1, parseInt(p.qty) || 1),
+        x:    parseFloat(p.x) || 0,
+        y:    parseFloat(p.y) || 0,
+        z:    parseFloat(p.z) || 0,
+      })) : [],
+    };
 
     res.json({ pieces, cabinet });
 
