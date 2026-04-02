@@ -1,52 +1,37 @@
-import express from "express";
-import cors from "cors";
-import rateLimit from "express-rate-limit";
+import express from 'express';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 
 const app = express();
-
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-// ── CORS ──────────────────────────────────────────────────────────────────
 app.use(cors({
   origin: (origin, cb) => {
-    // Autorise l'app React (Netlify) + localhost dev
-    if (!origin || origin.includes('netlify.app') || origin.includes('localhost')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Not allowed by CORS'));
-    }
+    if (!origin || origin.includes('netlify.app') || origin.includes('localhost') || origin.includes('panelcut')) cb(null, true);
+    else cb(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST'],
 }));
 
-app.use(express.json({ limit: '10mb' })); // images base64 peuvent être grandes
+app.use(express.json({ limit: '15mb' }));
 
-// ── Rate limiting ─────────────────────────────────────────────────────────
 app.use('/scan', rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 heure
-  max: 20,                   // 20 scans max par IP par heure
-  message: { error: 'too_many_requests' }
+  windowMs: 60 * 60 * 1000,
+  max: 30,
+  message: { error: 'too_many_requests' },
 }));
 
-// ── Healthcheck ───────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// ── POST /scan ────────────────────────────────────────────────────────────
-// Body: { image: "base64string", mediaType: "image/jpeg" }
-// Retourne: { pieces: [{name, length, height, qty}] }
+// ───────────────────────────────────────────────────────────────────────────
 app.post('/scan', async (req, res) => {
   const { image, mediaType } = req.body;
+  if (!image)             return res.status(400).json({ error: 'missing_image' });
+  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'api_key_missing' });
 
-  if (!image) {
-    return res.status(400).json({ error: 'missing_image' });
-  }
-
-  if (!ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'api_key_missing' });
-  }
-
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+  // ─ Helper : appel Claude Vision ─────────────────────────────────────────────
+  const callClaude = async (prompt, maxTokens = 2048) => {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -54,100 +39,302 @@ app.post('/scan', async (req, res) => {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'image',
-                source: {
-                  type: 'base64',
-                  media_type: mediaType || 'image/jpeg',
-                  data: image,
-                }
-              },
-              {
-                type: 'text',
-                text: `Tu es un expert menuisier. Analyse ce plan de découpe et extrait toutes les pièces avec leurs dimensions.
+        model: 'claude-opus-4-5',
+        max_tokens: maxTokens,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: image } },
+            { type: 'text', text: prompt },
+          ],
+        }],
+      }),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      throw Object.assign(new Error('api_error'), { status: r.status, detail: e });
+    }
+    const d = await r.json();
+    return d.content?.[0]?.text || '';
+  };
 
-RÈGLES STRICTES :
-- Retourne UNIQUEMENT un JSON valide, rien d'autre
-- Pas de texte avant ou après le JSON
-- Pas de backticks, pas de markdown
-- Si tu ne vois pas de dimensions claires, retourne {"pieces": [], "error": "no_dimensions"}
+  // ─ Parse JSON robuste ────────────────────────────────────────────────────────
+  const parseJSON = (text) => {
+    // Extrait le premier bloc JSON valide de la réponse
+    const clean = text.replace(/```json|```/g, '').trim();
+    // Tente parse direct
+    try { return JSON.parse(clean); } catch {}
+    // Cherche un objet JSON dans le texte
+    const m = clean.match(/\{[\s\S]*\}/);
+    if (m) try { return JSON.parse(m[0]); } catch {}
+    return null;
+  };
 
-FORMAT EXACT à retourner :
+  try {
+    // ═══════════════════════════════════════════════════════════════════════
+    // PASSE 1 — Lecture globale du meuble (structure + dimensions extérieures)
+    // But : comprendre le meuble AVANT d'extraire les pièces
+    // ═══════════════════════════════════════════════════════════════════════
+    const pass1prompt = `Tu es un expert en lecture de plans de menuiserie.
+
+ANALYSE CE PLAN et retourne UNIQUEMENT un JSON valide (aucun texte avant/après).
+
+OBJECTIF PASSE 1 : Comprendre la structure globale du meuble.
+
+JSON à retourner :
+{
+  "type": "armoire" | "bibliotheque" | "cuisine" | "bureau" | "commode" | "autre",
+  "name": "nom du meuble si visible sur le plan",
+  "width":  <largeur totale extérieure en cm, ex: 120>,
+  "height": <hauteur totale extérieure en cm, ex: 210>,
+  "depth":  <profondeur en cm, ex: 60 — si non visible mets 60>,
+  "thickness": <épaisseur des panneaux en cm, ex: 1.8 — si non visible mets 1.8>,
+  "material": "melamine" | "contreplaque" | "mdf" | "bois_massif" | "inconnu",
+  "unit": "cm" | "mm" | "m",
+  "scale_note": "note sur l’échelle si tu la vois (ex: 1:10)",
+  "nb_shelves": <nombre de tablettes visibles, entier>,
+  "nb_doors": <nombre de portes visibles, entier>,
+  "nb_drawers": <nombre de tiroirs visibles, entier>,
+  "nb_dividers": <nombre de séparations verticales intérieures, entier>,
+  "confidence": <0.0 à 1.0, ta confiance dans les dimensions lues>
+}
+
+Si une valeur n’est pas visible, utilise null sauf pour depth/thickness où tu mets les valeurs standard.`;
+
+    const raw1 = await callClaude(pass1prompt, 1024);
+    const cabinet = parseJSON(raw1) || {};
+
+    // Normalise l’unité — convertit tout en cm
+    const toСm = (v, unit) => {
+      if (v === null || v === undefined) return null;
+      if (unit === 'mm') return v / 10;
+      if (unit === 'm')  return v * 100;
+      return v;
+    };
+    const unit = cabinet.unit || 'cm';
+    const cabNorm = {
+      type:      cabinet.type      || 'autre',
+      name:      cabinet.name      || '',
+      width:     toСm(cabinet.width,     unit),
+      height:    toСm(cabinet.height,    unit),
+      depth:     toСm(cabinet.depth,     unit) || 60,
+      thickness: toСm(cabinet.thickness, unit) || 1.8,
+      material:  cabinet.material  || 'inconnu',
+      nb_shelves:   cabinet.nb_shelves   || 0,
+      nb_doors:     cabinet.nb_doors     || 0,
+      nb_drawers:   cabinet.nb_drawers   || 0,
+      nb_dividers:  cabinet.nb_dividers  || 0,
+      confidence:   cabinet.confidence   || 0.5,
+      scale_note:   cabinet.scale_note   || '',
+    };
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PASSE 2 — Extraction exhaustive de toutes les pièces
+    // On injecte le contexte de la passe 1 pour que Claude soit plus précis
+    // ═══════════════════════════════════════════════════════════════════════
+    const context = cabNorm.width
+      ? `CONTEXTE PASSE 1 : meuble ${cabNorm.type}, dimensions ext: ${cabNorm.width}\u00d7${cabNorm.height}\u00d7${cabNorm.depth} cm, épaisseur ${cabNorm.thickness} cm, ${cabNorm.nb_shelves} tablettes, ${cabNorm.nb_doors} portes, ${cabNorm.nb_drawers} tiroirs, ${cabNorm.nb_dividers} séparations.`
+      : '';
+
+    const pass2prompt = `Tu es un expert menuisier CAO.
+${context}
+
+ANALYSE CE PLAN et retourne UNIQUEMENT un JSON valide (aucun texte avant/après).
+
+OBJECTIF PASSE 2 : Extraire CHAQUE pièce individuelle avec ses dimensions exactes et son rôle structural.
+
+RÔLES POSSIBLES :
+- "side"         : panneau lateral / montant / côté extérieur
+- "top"          : dessus / couronnement
+- "bottom"       : fond bas / plateau bas
+- "shelf"        : tablette / étagère horizontale intérieure
+- "divider"      : séparation verticale intérieure
+- "back"         : fond arrière / dos
+- "door"         : porte (battant)
+- "drawer_front" : facade de tiroir
+- "drawer_box"   : caisse de tiroir (les 4 côtés)
+- "other"        : autre élément
+
+FORMAT EXACT :
 {
   "pieces": [
-    {"name": "Montant", "length": 226.4, "height": 58, "qty": 4},
-    {"name": "Tablette", "length": 75.6, "height": 58, "qty": 2}
+    {
+      "name": "Côté gauche",
+      "role": "side",
+      "length": 210.0,
+      "height": 60.0,
+      "thickness": 1.8,
+      "qty": 2,
+      "material": "melamine",
+      "notes": "avec évidement poignée" 
+    }
   ]
 }
 
-COMMENT LIRE LES PLANS :
-- Les dimensions sont en cm généralement
-- "qty" = nombre de pièces identiques (cherche les annotations comme "x4", "4P", "(4)", "×4")
-- Si pas de quantité indiquée, mets 1
-- Le nom = type de pièce (montant, tablette, étagère, traverse, dos, fond, côté...)
-- Si le nom n'est pas clair, utilise "Pièce 1", "Pièce 2", etc.
-- Longueur = la plus grande dimension
-- Hauteur = la plus petite dimension
+RÈGLES STRICTES :
+1. Extrais TOUTES les pièces — même celles sans cote si tu peux les déduire du contexte
+2. "length" = plus grande dimension planaire (cm)
+3. "height" = deuxième dimension planaire (cm) — PAS la profondeur
+4. "thickness" = épaisseur (cm) — si non visible utilise ${cabNorm.thickness || 1.8}
+5. "qty" : cherche x2, \u00d72, (2), \"2 pièces\", \"identiques\", symétrie gauche/droite
+6. Convertis TOUTES les dimensions en cm
+7. Si le plan a des vues multiples (face + côté + dessus), exploite-les toutes
+8. Vérifie la cohérence : la somme des pièces doit correspondre au meuble global
+9. "notes" : ajoute toute info utile (découpe, finition, sens du fil, percements)
+10. Ne jamais retourner length=0 ou height=0
 
-Extrait TOUTES les pièces visibles sur ce plan.`
-              }
-            ]
-          }
-        ]
-      })
-    });
+Si une cote est illégible, déduis-la mathématiquement depuis les autres cotes visibles.`;
 
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      console.error('Anthropic API error:', response.status, err);
-      return res.status(500).json({ error: 'api_error', detail: err });
+    const raw2 = await callClaude(pass2prompt, 2048);
+    const result2 = parseJSON(raw2);
+
+    if (!result2?.pieces?.length) {
+      return res.status(422).json({ error: 'no_pieces', raw: raw2 });
     }
 
-    const data = await response.json();
-    const text = data.content?.[0]?.text || '';
-
-    // Parse le JSON retourné par Claude
-    let parsed;
-    try {
-      // Nettoie au cas où Claude aurait quand même mis des backticks
-      const clean = text.replace(/```json|```/g, '').trim();
-      parsed = JSON.parse(clean);
-    } catch (e) {
-      console.error('JSON parse error:', text);
-      return res.status(422).json({ error: 'parse_error', raw: text });
-    }
-
-    // Valide et nettoie les pièces
-    const pieces = (parsed.pieces || [])
+    // ─ Nettoyage + validation des pièces ──────────────────────────────────────────
+    const VALID_ROLES = ['side','top','bottom','shelf','divider','back','door','drawer_front','drawer_box','other'];
+    const pieces = result2.pieces
       .filter(p => p.length > 0 && p.height > 0)
-      .map(p => ({
-        name:   String(p.name || 'Pièce').slice(0, 50),
-        length: Math.abs(parseFloat(p.length) || 0),
-        height: Math.abs(parseFloat(p.height) || 0),
-        qty:    Math.max(1, Math.round(parseFloat(p.qty) || 1)),
-      }))
+      .map(p => {
+        const len = Math.abs(parseFloat(p.length) || 0);
+        const hgt = Math.abs(parseFloat(p.height) || 0);
+        return {
+          name:      String(p.name || 'Pièce').slice(0, 60),
+          role:      VALID_ROLES.includes(p.role) ? p.role : 'other',
+          length:    Math.max(len, hgt),   // toujours length >= height
+          height:    Math.min(len, hgt),
+          thickness: Math.abs(parseFloat(p.thickness) || cabNorm.thickness || 1.8),
+          qty:       Math.max(1, Math.round(parseFloat(p.qty) || 1)),
+          material:  String(p.material || cabNorm.material || 'inconnu').slice(0, 30),
+          notes:     String(p.notes || '').slice(0, 100),
+        };
+      })
       .filter(p => p.length > 0 && p.height > 0);
 
-    res.json({ pieces, raw: text });
+    // ─ Génère les panneaux structurels pour la vue 3D ─────────────────────────
+    // On reconstruit les positions 2D (x, y) de chaque panneau dans le meuble
+    // pour les passer à CabinetPlan3D
+    const cabinetPanels = buildCabinetPanels(pieces, cabNorm);
+
+    res.json({
+      pieces,
+      cabinet: { ...cabNorm, panels: cabinetPanels },
+      raw1,
+      raw2,
+    });
 
   } catch (err) {
-    console.error('Scan error:', err.message);
+    console.error('Scan error:', err.message, err.detail || '');
+    if (err.message === 'api_error') {
+      return res.status(502).json({ error: 'api_error', status: err.status, detail: err.detail });
+    }
     res.status(500).json({ error: 'server_error', message: err.message });
   }
 });
 
-// ── Middleware erreur global ──────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────
+// buildCabinetPanels : reconstitue les positions x,y de chaque panneau
+// dans l’espace 2D du meuble pour la vue 3D
+// ───────────────────────────────────────────────────────────────────────────
+function buildCabinetPanels(pieces, cab) {
+  if (!cab.width || !cab.height) return [];
+  const T = cab.thickness || 1.8;
+  const W = cab.width, H = cab.height;
+  const panels = [];
+
+  // Compteurs pour positionner les éléments répétés
+  let shelfIdx = 0, divIdx = 0, doorIdx = 0, drawerIdx = 0;
+
+  for (const p of pieces) {
+    const qty = p.qty || 1;
+    const l = p.length, h = p.height;
+
+    for (let q = 0; q < qty; q++) {
+      let panel = { role: p.role, w: l, h, name: p.name };
+
+      switch (p.role) {
+        case 'side':
+          // Côté gauche d’abord, puis droit
+          panel.x = q === 0 ? 0 : W - T;
+          panel.y = 0;
+          panel.w = T; panel.h = h;
+          break;
+
+        case 'top':
+          panel.x = T; panel.y = H - T;
+          panel.w = W - 2 * T; panel.h = T;
+          break;
+
+        case 'bottom':
+          panel.x = T; panel.y = 0;
+          panel.w = W - 2 * T; panel.h = T;
+          break;
+
+        case 'shelf': {
+          // Répartir les tablettes uniformément entre bottom et top
+          const totalShelves = cab.nb_shelves || 1;
+          const usableH = H - 2 * T;
+          const gap = usableH / (totalShelves + 1);
+          panel.x = T;
+          panel.y = T + gap * (shelfIdx + 1);
+          panel.w = W - 2 * T; panel.h = T;
+          shelfIdx++;
+          break;
+        }
+
+        case 'divider': {
+          const totalDiv = cab.nb_dividers || 1;
+          const usableW = W - 2 * T;
+          const gap = usableW / (totalDiv + 1);
+          panel.x = T + gap * (divIdx + 1);
+          panel.y = T;
+          panel.w = T; panel.h = H - 2 * T;
+          divIdx++;
+          break;
+        }
+
+        case 'back':
+          panel.x = T; panel.y = T;
+          panel.w = W - 2 * T; panel.h = H - 2 * T;
+          break;
+
+        case 'door': {
+          const totalDoors = cab.nb_doors || 1;
+          const doorW = (W - 2 * T) / totalDoors;
+          panel.x = T + doorW * doorIdx;
+          panel.y = T;
+          panel.w = doorW; panel.h = H - 2 * T;
+          doorIdx++;
+          break;
+        }
+
+        case 'drawer_front': {
+          const totalDrawers = cab.nb_drawers || 1;
+          const drawerH = (H - 2 * T) / totalDrawers;
+          panel.x = T;
+          panel.y = T + drawerH * drawerIdx;
+          panel.w = W - 2 * T; panel.h = drawerH;
+          drawerIdx++;
+          break;
+        }
+
+        default:
+          panel.x = T; panel.y = T;
+          panel.w = l; panel.h = h;
+      }
+
+      panels.push(panel);
+    }
+  }
+
+  return panels;
+}
+
 app.use((err, _req, res, _next) => {
   console.error('Unhandled:', err.message);
   res.status(500).json({ error: 'server_error' });
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`PanelCut server on port ${PORT}`));
