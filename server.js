@@ -39,7 +39,7 @@ app.post('/scan', async (req, res) => {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-opus-4-5',
+        model: 'claude-opus-4-20241022', // Version stable recommandée
         max_tokens: maxTokens,
         messages: [{
           role: 'user',
@@ -60,11 +60,8 @@ app.post('/scan', async (req, res) => {
 
   // ─ Parse JSON robuste ────────────────────────────────────────────────────────
   const parseJSON = (text) => {
-    // Extrait le premier bloc JSON valide de la réponse
     const clean = text.replace(/```json|```/g, '').trim();
-    // Tente parse direct
     try { return JSON.parse(clean); } catch {}
-    // Cherche un objet JSON dans le texte
     const m = clean.match(/\{[\s\S]*\}/);
     if (m) try { return JSON.parse(m[0]); } catch {}
     return null;
@@ -72,8 +69,7 @@ app.post('/scan', async (req, res) => {
 
   try {
     // ═══════════════════════════════════════════════════════════════════════
-    // PASSE 1 — Lecture globale du meuble (structure + dimensions extérieures)
-    // But : comprendre le meuble AVANT d'extraire les pièces
+    // PASSE 1 — Lecture globale du meuble
     // ═══════════════════════════════════════════════════════════════════════
     const pass1prompt = `Tu es un expert en lecture de plans de menuiserie.
 
@@ -85,27 +81,26 @@ JSON à retourner :
 {
   "type": "armoire" | "bibliotheque" | "cuisine" | "bureau" | "commode" | "autre",
   "name": "nom du meuble si visible sur le plan",
-  "width":  <largeur totale extérieure en cm, ex: 120>,
-  "height": <hauteur totale extérieure en cm, ex: 210>,
-  "depth":  <profondeur en cm, ex: 60 — si non visible mets 60>,
-  "thickness": <épaisseur des panneaux en cm, ex: 1.8 — si non visible mets 1.8>,
+  "width":  <largeur totale extérieure en cm>,
+  "height": <hauteur totale extérieure en cm>,
+  "depth":  <profondeur en cm, défaut 60>,
+  "thickness": <épaisseur des panneaux en cm, défaut 1.8>,
   "material": "melamine" | "contreplaque" | "mdf" | "bois_massif" | "inconnu",
   "unit": "cm" | "mm" | "m",
-  "scale_note": "note sur l’échelle si tu la vois (ex: 1:10)",
-  "nb_shelves": <nombre de tablettes visibles, entier>,
-  "nb_doors": <nombre de portes visibles, entier>,
-  "nb_drawers": <nombre de tiroirs visibles, entier>,
-  "nb_dividers": <nombre de séparations verticales intérieures, entier>,
-  "confidence": <0.0 à 1.0, ta confiance dans les dimensions lues>
+  "nb_shelves": <nombre de tablettes>,
+  "nb_doors": <nombre de portes>,
+  "nb_drawers": <nombre de tiroirs>,
+  "nb_dividers": <nombre de séparations verticales>,
+  "confidence": <0.0 à 1.0>
 }
 
-Si une valeur n’est pas visible, utilise null sauf pour depth/thickness où tu mets les valeurs standard.`;
+Si une valeur n'est pas visible, utilise null sauf pour depth/thickness où tu mets les valeurs standard.`;
 
     const raw1 = await callClaude(pass1prompt, 1024);
     const cabinet = parseJSON(raw1) || {};
 
-    // Normalise l’unité — convertit tout en cm
-    const toСm = (v, unit) => {
+    // Normalise l'unité — convertit tout en cm
+    const toCm = (v, unit) => {
       if (v === null || v === undefined) return null;
       if (unit === 'mm') return v / 10;
       if (unit === 'm')  return v * 100;
@@ -115,10 +110,10 @@ Si une valeur n’est pas visible, utilise null sauf pour depth/thickness où tu
     const cabNorm = {
       type:      cabinet.type      || 'autre',
       name:      cabinet.name      || '',
-      width:     toСm(cabinet.width,     unit),
-      height:    toСm(cabinet.height,    unit),
-      depth:     toСm(cabinet.depth,     unit) || 60,
-      thickness: toСm(cabinet.thickness, unit) || 1.8,
+      width:     toCm(cabinet.width,     unit),
+      height:    toCm(cabinet.height,    unit),
+      depth:     toCm(cabinet.depth,     unit) || 60,
+      thickness: toCm(cabinet.thickness, unit) || 1.8,
       material:  cabinet.material  || 'inconnu',
       nb_shelves:   cabinet.nb_shelves   || 0,
       nb_doors:     cabinet.nb_doors     || 0,
@@ -130,10 +125,9 @@ Si une valeur n’est pas visible, utilise null sauf pour depth/thickness où tu
 
     // ═══════════════════════════════════════════════════════════════════════
     // PASSE 2 — Extraction exhaustive de toutes les pièces
-    // On injecte le contexte de la passe 1 pour que Claude soit plus précis
     // ═══════════════════════════════════════════════════════════════════════
     const context = cabNorm.width
-      ? `CONTEXTE PASSE 1 : meuble ${cabNorm.type}, dimensions ext: ${cabNorm.width}\u00d7${cabNorm.height}\u00d7${cabNorm.depth} cm, épaisseur ${cabNorm.thickness} cm, ${cabNorm.nb_shelves} tablettes, ${cabNorm.nb_doors} portes, ${cabNorm.nb_drawers} tiroirs, ${cabNorm.nb_dividers} séparations.`
+      ? `CONTEXTE PASSE 1 : meuble ${cabNorm.type}, dimensions ext: ${cabNorm.width}×${cabNorm.height}×${cabNorm.depth} cm, épaisseur ${cabNorm.thickness} cm.`
       : '';
 
     const pass2prompt = `Tu es un expert menuisier CAO.
@@ -141,19 +135,9 @@ ${context}
 
 ANALYSE CE PLAN et retourne UNIQUEMENT un JSON valide (aucun texte avant/après).
 
-OBJECTIF PASSE 2 : Extraire CHAQUE pièce individuelle avec ses dimensions exactes et son rôle structural.
+OBJECTIF PASSE 2 : Extraire CHAQUE pièce individuelle avec ses dimensions exactes.
 
-RÔLES POSSIBLES :
-- "side"         : panneau lateral / montant / côté extérieur
-- "top"          : dessus / couronnement
-- "bottom"       : fond bas / plateau bas
-- "shelf"        : tablette / étagère horizontale intérieure
-- "divider"      : séparation verticale intérieure
-- "back"         : fond arrière / dos
-- "door"         : porte (battant)
-- "drawer_front" : facade de tiroir
-- "drawer_box"   : caisse de tiroir (les 4 côtés)
-- "other"        : autre élément
+RÔLES POSSIBLES : "side", "top", "bottom", "shelf", "divider", "back", "door", "drawer_front", "drawer_box", "other".
 
 FORMAT EXACT :
 {
@@ -172,18 +156,13 @@ FORMAT EXACT :
 }
 
 RÈGLES STRICTES :
-1. Extrais TOUTES les pièces — même celles sans cote si tu peux les déduire du contexte
-2. "length" = plus grande dimension planaire (cm)
-3. "height" = deuxième dimension planaire (cm) — PAS la profondeur
-4. "thickness" = épaisseur (cm) — si non visible utilise ${cabNorm.thickness || 1.8}
-5. "qty" : cherche x2, \u00d72, (2), \"2 pièces\", \"identiques\", symétrie gauche/droite
-6. Convertis TOUTES les dimensions en cm
-7. Si le plan a des vues multiples (face + côté + dessus), exploite-les toutes
-8. Vérifie la cohérence : la somme des pièces doit correspondre au meuble global
-9. "notes" : ajoute toute info utile (découpe, finition, sens du fil, percements)
-10. Ne jamais retourner length=0 ou height=0
-
-Si une cote est illégible, déduis-la mathématiquement depuis les autres cotes visibles.`;
+1. Extrais TOUTES les pièces.
+2. "length" = plus grande dimension planaire (cm).
+3. "height" = deuxième dimension planaire (cm).
+4. "thickness" = épaisseur (cm).
+5. "qty" : cherche x2, ×2, (2), symétrie.
+6. Convertis TOUTES les dimensions en cm.
+7. Ne jamais retourner length=0 ou height=0.`;
 
     const raw2 = await callClaude(pass2prompt, 2048);
     const result2 = parseJSON(raw2);
@@ -202,7 +181,7 @@ Si une cote est illégible, déduis-la mathématiquement depuis les autres cotes
         return {
           name:      String(p.name || 'Pièce').slice(0, 60),
           role:      VALID_ROLES.includes(p.role) ? p.role : 'other',
-          length:    Math.max(len, hgt),   // toujours length >= height
+          length:    Math.max(len, hgt),
           height:    Math.min(len, hgt),
           thickness: Math.abs(parseFloat(p.thickness) || cabNorm.thickness || 1.8),
           qty:       Math.max(1, Math.round(parseFloat(p.qty) || 1)),
@@ -213,8 +192,6 @@ Si une cote est illégible, déduis-la mathématiquement depuis les autres cotes
       .filter(p => p.length > 0 && p.height > 0);
 
     // ─ Génère les panneaux structurels pour la vue 3D ─────────────────────────
-    // On reconstruit les positions 2D (x, y) de chaque panneau dans le meuble
-    // pour les passer à CabinetPlan3D
     const cabinetPanels = buildCabinetPanels(pieces, cabNorm);
 
     res.json({
@@ -235,7 +212,6 @@ Si une cote est illégible, déduis-la mathématiquement depuis les autres cotes
 
 // ───────────────────────────────────────────────────────────────────────────
 // buildCabinetPanels : reconstitue les positions x,y de chaque panneau
-// dans l’espace 2D du meuble pour la vue 3D
 // ───────────────────────────────────────────────────────────────────────────
 function buildCabinetPanels(pieces, cab) {
   if (!cab.width || !cab.height) return [];
@@ -243,7 +219,6 @@ function buildCabinetPanels(pieces, cab) {
   const W = cab.width, H = cab.height;
   const panels = [];
 
-  // Compteurs pour positionner les éléments répétés
   let shelfIdx = 0, divIdx = 0, doorIdx = 0, drawerIdx = 0;
 
   for (const p of pieces) {
@@ -255,7 +230,6 @@ function buildCabinetPanels(pieces, cab) {
 
       switch (p.role) {
         case 'side':
-          // Côté gauche d’abord, puis droit
           panel.x = q === 0 ? 0 : W - T;
           panel.y = 0;
           panel.w = T; panel.h = h;
@@ -272,7 +246,6 @@ function buildCabinetPanels(pieces, cab) {
           break;
 
         case 'shelf': {
-          // Répartir les tablettes uniformément entre bottom et top
           const totalShelves = cab.nb_shelves || 1;
           const usableH = H - 2 * T;
           const gap = usableH / (totalShelves + 1);
