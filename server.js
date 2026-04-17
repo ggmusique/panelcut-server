@@ -5,8 +5,9 @@ import https from 'node:https';
 
 const app = express();
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const DEFAULT_CLAUDE_MODEL = 'claude-3-5-sonnet-20241022';
-const CLAUDE_MODEL_FALLBACKS = [DEFAULT_CLAUDE_MODEL, 'claude-opus-4-6'];
+const MODEL = process.env.CLAUDE_MODEL;
+const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-20250514';
+const CLAUDE_MODEL_FALLBACKS = [DEFAULT_CLAUDE_MODEL, 'claude-sonnet-4-6'];
 const CLAUDE_TIMEOUT_MS = 20000;
 const MAX_IMAGE_BASE64_LENGTH = 14 * 1024 * 1024; // ~10.5MB binaire
 const MIN_IMAGE_BASE64_LENGTH = 128;
@@ -15,6 +16,7 @@ const BASE64_RE = /^[A-Za-z0-9+/=\r\n]+$/;
 const MIN_DIM_CM = 1;
 const MAX_DIM_CM = 500;
 const MAX_THICKNESS_CM = 20;
+const VALID_MODELS = new Set(CLAUDE_MODEL_FALLBACKS);
 
 app.use(cors({
   origin: (origin, cb) => {
@@ -67,11 +69,13 @@ const parsePossibleJSON = (text) => {
 };
 
 const getModelCandidates = () => {
-  const requestedModel = String(process.env.CLAUDE_MODEL || '').trim();
-  const invalidAliases = new Set(['latest', 'claude-latest']);
+  const requestedModel = String(MODEL || '').trim();
+  const invalidAliases = new Set(['latest', 'claude-latest', 'claude-3-opus-latest', 'claude-3-5-sonnet-latest']);
   const candidates = [];
-  if (requestedModel && !invalidAliases.has(requestedModel.toLowerCase())) {
+  if (requestedModel && !invalidAliases.has(requestedModel.toLowerCase()) && VALID_MODELS.has(requestedModel)) {
     candidates.push(requestedModel);
+  } else if (requestedModel) {
+    console.warn('Invalid CLAUDE_MODEL, fallback applied:', { requestedModel, fallback: DEFAULT_CLAUDE_MODEL });
   }
   for (const model of CLAUDE_MODEL_FALLBACKS) {
     if (!candidates.includes(model)) candidates.push(model);
@@ -83,6 +87,12 @@ const fetchCompat = async (url, options = {}) => {
   if (typeof globalThis.fetch === 'function') {
     return globalThis.fetch(url, options);
   }
+  try {
+    const mod = await import('node-fetch');
+    if (typeof mod.default === 'function') {
+      return mod.default(url, options);
+    }
+  } catch {}
   return new Promise((resolve, reject) => {
     const target = new URL(url);
     const req = https.request({
@@ -332,7 +342,7 @@ RÈGLES STRICTES :
     const result2 = parseJSON(raw2);
 
     if (!result2?.pieces?.length) {
-      return res.status(422).json({ error: 'no_pieces', raw: raw2 });
+      return res.status(422).json({ error: 'no_pieces', status: 422, detail: raw2 });
     }
 
     // ─ Nettoyage + validation des pièces ──────────────────────────────────────────
@@ -353,7 +363,7 @@ RÈGLES STRICTES :
           length:    normalizedLength,
           height:    normalizedHeight,
           thickness: normalizedThickness,
-          qty:       Math.max(1, Math.round(toFiniteNumber(p.qty) ?? 1)),
+          qty:       Math.max(0, Math.round(toFiniteNumber(p.qty) ?? 0)),
           material:  String(p.material ?? cabNorm.material ?? 'inconnu').slice(0, 30),
           notes:     String(p.notes ?? '').slice(0, 100),
         };
