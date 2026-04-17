@@ -26,7 +26,7 @@ export default async function handler(req, res) {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-3-5-sonnet-20241022',
+        model: 'claude-3-5-sonnet-latest',
         max_tokens: 2048,
         messages: [{
           role: 'user',
@@ -35,7 +35,7 @@ export default async function handler(req, res) {
             { type: 'text', text: `Expert menuisier. Analyse ce plan de meuble.
 Retourne UNIQUEMENT ce JSON (sans backticks) :
 {"pieces":[{"name":"Montant G","length":220,"height":58,"qty":2}],"cabinet":{"type":"armoire","width":120,"height":220,"depth":58,"thickness":1.8,"plinth":8,"modules":[{"x":0,"width":60,"shelves":2,"doors":1,"drawers":0}],"panels":[{"role":"side","name":"C\u00f4t\u00e9 G","w":58,"h":220,"qty":1,"x":0,"y":0,"z":0}]}}
-R\u00e8gles: dimensions en cm, length=grande dim, height=petite dim, qty r\u00e9el. Types cabinet: armoire|biblioth\u00e8que|cuisine|buffet|meuble-tv|dressing|autre. Roles panels: side|back|top|bottom|shelf|divider|door|drawer_front. Mets 0 si illisible.` }
+R\u00e8gles: dimensions en cm, length=grande dim, height=petite dim, qty r\u00e9el. Types: armoire|biblioth\u00e8que|cuisine|buffet|meuble-tv|dressing|autre. Roles: side|back|top|bottom|shelf|divider|door|drawer_front. Mets 0 si illisible.` }
           ]
         }]
       }),
