@@ -23,7 +23,7 @@ export default async function handler(req, res) {
   const userText = [contextSummary, prompt || 'Retourne le JSON corrig\u00e9.'].filter(Boolean).join(' ');
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 9000);
+  const timeout = setTimeout(() => controller.abort(), 25000);
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
