@@ -1,9 +1,20 @@
 import express from 'express';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
+import https from 'node:https';
 
 const app = express();
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const DEFAULT_CLAUDE_MODEL = 'claude-3-5-sonnet-20241022';
+const CLAUDE_MODEL_FALLBACKS = [DEFAULT_CLAUDE_MODEL, 'claude-opus-4-6'];
+const CLAUDE_TIMEOUT_MS = 20000;
+const MAX_IMAGE_BASE64_LENGTH = 14 * 1024 * 1024; // ~10.5MB binaire
+const MIN_IMAGE_BASE64_LENGTH = 128;
+const VALID_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+const BASE64_RE = /^[A-Za-z0-9+/=\r\n]+$/;
+const MIN_DIM_CM = 1;
+const MAX_DIM_CM = 500;
+const MAX_THICKNESS_CM = 20;
 
 app.use(cors({
   origin: (origin, cb) => {
@@ -23,39 +34,180 @@ app.use('/scan', rateLimit({
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
+const toFiniteNumber = (value) => {
+  const n = Number.parseFloat(value);
+  return Number.isFinite(n) ? n : null;
+};
+
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+const safeJsonParse = (text) => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+};
+
+const normalizeError = (error) => {
+  if (!error) return { message: 'unknown_error' };
+  if (typeof error === 'string') return { message: error };
+  return {
+    message: error.message || 'unknown_error',
+    code: error.code,
+    status: error.status,
+    detail: error.detail,
+    name: error.name,
+  };
+};
+
+const parsePossibleJSON = (text) => {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  return safeJsonParse(text);
+};
+
+const getModelCandidates = () => {
+  const requestedModel = String(process.env.CLAUDE_MODEL || '').trim();
+  const invalidAliases = new Set(['latest', 'claude-latest']);
+  const candidates = [];
+  if (requestedModel && !invalidAliases.has(requestedModel.toLowerCase())) {
+    candidates.push(requestedModel);
+  }
+  for (const model of CLAUDE_MODEL_FALLBACKS) {
+    if (!candidates.includes(model)) candidates.push(model);
+  }
+  return candidates;
+};
+
+const fetchCompat = async (url, options = {}) => {
+  if (typeof globalThis.fetch === 'function') {
+    return globalThis.fetch(url, options);
+  }
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const req = https.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || 443,
+      path: `${target.pathname}${target.search}`,
+      method: options.method || 'GET',
+      headers: options.headers || {},
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        const bodyText = Buffer.concat(chunks).toString('utf8');
+        resolve({
+          ok: (res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300,
+          status: res.statusCode || 0,
+          json: async () => safeJsonParse(bodyText),
+          text: async () => bodyText,
+        });
+      });
+    });
+    req.on('error', reject);
+    if (options.signal) {
+      options.signal.addEventListener('abort', () => {
+        const abortErr = new Error('request_aborted');
+        abortErr.code = 'ABORT_ERR';
+        req.destroy(abortErr);
+      });
+    }
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+};
+
 // ───────────────────────────────────────────────────────────────────────────
 app.post('/scan', async (req, res) => {
   const { image, mediaType } = req.body;
-  if (!image)             return res.status(400).json({ error: 'missing_image' });
-  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'api_key_missing' });
+  if (!image) return res.status(400).json({ error: 'missing_image', status: 400, detail: null });
+  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'api_key_missing', status: 500, detail: null });
+  if (typeof image !== 'string') return res.status(400).json({ error: 'invalid_image_format', status: 400, detail: 'image_must_be_string' });
+
+  const normalizedImage = image.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '').replace(/\s/g, '');
+  if (!BASE64_RE.test(normalizedImage)) return res.status(400).json({ error: 'invalid_image_encoding', status: 400, detail: 'invalid_base64' });
+  if (normalizedImage.length < MIN_IMAGE_BASE64_LENGTH) return res.status(400).json({ error: 'image_too_small', status: 400, detail: `min_base64_chars_${MIN_IMAGE_BASE64_LENGTH}` });
+  if (normalizedImage.length > MAX_IMAGE_BASE64_LENGTH) return res.status(413).json({ error: 'image_too_large', status: 413, detail: `max_base64_chars_${MAX_IMAGE_BASE64_LENGTH}` });
+  const effectiveMediaType = VALID_MEDIA_TYPES.has(mediaType) ? mediaType : 'image/jpeg';
+  const imageSizeKb = Math.round((normalizedImage.length * 3 / 4) / 1024);
+  const modelCandidates = getModelCandidates();
+
+  console.info('SCAN DEBUG:', {
+    imageSizeKb,
+    mediaType: effectiveMediaType,
+    models: modelCandidates,
+  });
 
   // ─ Helper : appel Claude Vision ─────────────────────────────────────────────
   const callClaude = async (prompt, maxTokens = 2048) => {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-opus-4-20241022', // Version stable recommandée
-        max_tokens: maxTokens,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: image } },
-            { type: 'text', text: prompt },
-          ],
-        }],
-      }),
-    });
-    if (!r.ok) {
-      const e = await r.json().catch(() => ({}));
-      throw Object.assign(new Error('api_error'), { status: r.status, detail: e });
+    const tried = [];
+    for (const modelName of modelCandidates) {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timeout = setTimeout(() => {
+        if (controller) controller.abort();
+      }, CLAUDE_TIMEOUT_MS);
+      tried.push(modelName);
+
+      try {
+        const r = await fetchCompat('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+          },
+          signal: controller?.signal,
+          body: JSON.stringify({
+            model: modelName,
+            max_tokens: maxTokens,
+            temperature: 0,
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'image', source: { type: 'base64', media_type: effectiveMediaType, data: normalizedImage } },
+                { type: 'text', text: prompt },
+              ],
+            }],
+          }),
+        });
+
+        const raw = await r.text();
+        const detail = parsePossibleJSON(raw) || raw || null;
+
+        if (!r.ok) {
+          console.error('ANTHROPIC ERROR FULL:', { status: r.status, detail, raw, model: modelName });
+          const message = typeof detail === 'object' && detail?.error?.type === 'not_found_error'
+            ? 'api_model_not_found'
+            : 'api_error';
+          const err = Object.assign(new Error(message), { status: r.status, detail, raw, model: modelName });
+          throw err;
+        }
+
+        const d = parsePossibleJSON(raw);
+        if (!d || typeof d !== 'object') {
+          throw Object.assign(new Error('api_invalid_response'), { status: 502, detail: { reason: 'invalid_json' }, raw, model: modelName });
+        }
+        return d.content?.[0]?.text || '';
+      } catch (error) {
+        const isTimeout = error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
+        if (isTimeout) {
+          console.error('ANTHROPIC ERROR FULL:', { status: 504, detail: 'api_timeout', raw: null, model: modelName });
+          throw Object.assign(new Error('api_timeout'), { status: 504, detail: 'request_timeout', model: modelName });
+        }
+        if (error?.message === 'api_model_not_found' && modelName !== modelCandidates[modelCandidates.length - 1]) {
+          continue;
+        }
+        if (error?.message === 'api_error' || error?.message === 'api_invalid_response' || error?.message === 'api_model_not_found') {
+          throw error;
+        }
+        console.error('ANTHROPIC ERROR FULL:', { status: 502, detail: normalizeError(error), raw: null, model: modelName });
+        throw Object.assign(new Error('api_network_error'), { status: 502, detail: normalizeError(error), model: modelName });
+      } finally {
+        clearTimeout(timeout);
+      }
     }
-    const d = await r.json();
-    return d.content?.[0]?.text || '';
+    throw Object.assign(new Error('api_model_fallback_exhausted'), { status: 502, detail: { tried } });
   };
 
   // ─ Parse JSON robuste ────────────────────────────────────────────────────────
@@ -106,21 +258,33 @@ Si une valeur n'est pas visible, utilise null sauf pour depth/thickness où tu m
       if (unit === 'm')  return v * 100;
       return v;
     };
-    const unit = cabinet.unit || 'cm';
+    const unit = cabinet.unit ?? 'cm';
+    const normalizedWidth = toCm(cabinet.width, unit);
+    const normalizedHeight = toCm(cabinet.height, unit);
+    const normalizedDepth = toCm(cabinet.depth, unit);
+    const normalizedThickness = toCm(cabinet.thickness, unit);
+    const sanitizeDim = (v, fallback = null) => {
+      if (v === null || v === undefined) return fallback;
+      const num = toFiniteNumber(v);
+      if (num === null) return fallback;
+      if (num <= 0) return fallback;
+      return clamp(num, MIN_DIM_CM, MAX_DIM_CM);
+    };
+
     const cabNorm = {
-      type:      cabinet.type      || 'autre',
-      name:      cabinet.name      || '',
-      width:     toCm(cabinet.width,     unit),
-      height:    toCm(cabinet.height,    unit),
-      depth:     toCm(cabinet.depth,     unit) || 60,
-      thickness: toCm(cabinet.thickness, unit) || 1.8,
-      material:  cabinet.material  || 'inconnu',
-      nb_shelves:   cabinet.nb_shelves   || 0,
-      nb_doors:     cabinet.nb_doors     || 0,
-      nb_drawers:   cabinet.nb_drawers   || 0,
-      nb_dividers:  cabinet.nb_dividers  || 0,
-      confidence:   cabinet.confidence   || 0.5,
-      scale_note:   cabinet.scale_note   || '',
+      type:      cabinet.type      ?? 'autre',
+      name:      cabinet.name      ?? '',
+      width:     sanitizeDim(normalizedWidth, null),
+      height:    sanitizeDim(normalizedHeight, null),
+      depth:     sanitizeDim(normalizedDepth, 60),
+      thickness: clamp(sanitizeDim(normalizedThickness, 1.8), MIN_DIM_CM, MAX_THICKNESS_CM),
+      material:  cabinet.material  ?? 'inconnu',
+      nb_shelves:   Math.max(0, Math.round(toFiniteNumber(cabinet.nb_shelves) ?? 0)),
+      nb_doors:     Math.max(0, Math.round(toFiniteNumber(cabinet.nb_doors) ?? 0)),
+      nb_drawers:   Math.max(0, Math.round(toFiniteNumber(cabinet.nb_drawers) ?? 0)),
+      nb_dividers:  Math.max(0, Math.round(toFiniteNumber(cabinet.nb_dividers) ?? 0)),
+      confidence:   clamp(toFiniteNumber(cabinet.confidence) ?? 0.5, 0, 1),
+      scale_note:   cabinet.scale_note   ?? '',
     };
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -174,21 +338,27 @@ RÈGLES STRICTES :
     // ─ Nettoyage + validation des pièces ──────────────────────────────────────────
     const VALID_ROLES = ['side','top','bottom','shelf','divider','back','door','drawer_front','drawer_box','other'];
     const pieces = result2.pieces
-      .filter(p => p.length > 0 && p.height > 0)
+      .filter((p) => p && typeof p === 'object')
       .map(p => {
-        const len = Math.abs(parseFloat(p.length) || 0);
-        const hgt = Math.abs(parseFloat(p.height) || 0);
+        const len = Math.abs(toFiniteNumber(p.length) ?? 0);
+        const hgt = Math.abs(toFiniteNumber(p.height) ?? 0);
+        if (len <= 0 || hgt <= 0) return null;
+        const normalizedLength = clamp(Math.max(len, hgt), MIN_DIM_CM, MAX_DIM_CM);
+        const normalizedHeight = clamp(Math.min(len, hgt), MIN_DIM_CM, MAX_DIM_CM);
+        const thickness = Math.abs(toFiniteNumber(p.thickness) ?? cabNorm.thickness ?? 1.8);
+        const normalizedThickness = clamp(thickness, MIN_DIM_CM, MAX_THICKNESS_CM);
         return {
-          name:      String(p.name || 'Pièce').slice(0, 60),
+          name:      String(p.name ?? 'Pièce').slice(0, 60),
           role:      VALID_ROLES.includes(p.role) ? p.role : 'other',
-          length:    Math.max(len, hgt),
-          height:    Math.min(len, hgt),
-          thickness: Math.abs(parseFloat(p.thickness) || cabNorm.thickness || 1.8),
-          qty:       Math.max(1, Math.round(parseFloat(p.qty) || 1)),
-          material:  String(p.material || cabNorm.material || 'inconnu').slice(0, 30),
-          notes:     String(p.notes || '').slice(0, 100),
+          length:    normalizedLength,
+          height:    normalizedHeight,
+          thickness: normalizedThickness,
+          qty:       Math.max(1, Math.round(toFiniteNumber(p.qty) ?? 1)),
+          material:  String(p.material ?? cabNorm.material ?? 'inconnu').slice(0, 30),
+          notes:     String(p.notes ?? '').slice(0, 100),
         };
       })
+      .filter(Boolean)
       .filter(p => p.length > 0 && p.height > 0);
 
     // ─ Génère les panneaux structurels pour la vue 3D ─────────────────────────
@@ -202,11 +372,22 @@ RÈGLES STRICTES :
     });
 
   } catch (err) {
-    console.error('Scan error:', err.message, err.detail || '');
-    if (err.message === 'api_error') {
-      return res.status(502).json({ error: 'api_error', status: err.status, detail: err.detail });
+    const normalized = normalizeError(err);
+    console.error('Scan error:', {
+      message: normalized.message,
+      code: normalized.code,
+      status: normalized.status,
+      detail: normalized.detail,
+    });
+    if (err.message === 'api_error' || err.message === 'api_timeout' || err.message === 'api_network_error' || err.message === 'api_invalid_response') {
+      const status = Number.isInteger(err.status) ? err.status : 502;
+      return res.status(status).json({ error: 'api_error', status, detail: err.detail });
     }
-    res.status(500).json({ error: 'server_error', message: err.message });
+    if (err.message === 'api_model_fallback_exhausted' || err.message === 'api_model_not_found') {
+      const status = Number.isInteger(err.status) ? err.status : 502;
+      return res.status(status).json({ error: err.message, status, detail: err.detail });
+    }
+    res.status(500).json({ error: 'server_error', status: 500, detail: err.message });
   }
 });
 
@@ -215,14 +396,14 @@ RÈGLES STRICTES :
 // ───────────────────────────────────────────────────────────────────────────
 function buildCabinetPanels(pieces, cab) {
   if (!cab.width || !cab.height) return [];
-  const T = cab.thickness || 1.8;
+  const T = cab.thickness ?? 1.8;
   const W = cab.width, H = cab.height;
   const panels = [];
 
   let shelfIdx = 0, divIdx = 0, doorIdx = 0, drawerIdx = 0;
 
   for (const p of pieces) {
-    const qty = p.qty || 1;
+    const qty = p.qty ?? 0;
     const l = p.length, h = p.height;
 
     for (let q = 0; q < qty; q++) {
@@ -246,9 +427,9 @@ function buildCabinetPanels(pieces, cab) {
           break;
 
         case 'shelf': {
-          const totalShelves = cab.nb_shelves || 1;
+          const totalShelves = cab.nb_shelves ?? 0;
           const usableH = H - 2 * T;
-          const gap = usableH / (totalShelves + 1);
+          const gap = usableH / ((totalShelves > 0 ? totalShelves : 1) + 1);
           panel.x = T;
           panel.y = T + gap * (shelfIdx + 1);
           panel.w = W - 2 * T; panel.h = T;
@@ -257,9 +438,9 @@ function buildCabinetPanels(pieces, cab) {
         }
 
         case 'divider': {
-          const totalDiv = cab.nb_dividers || 1;
+          const totalDiv = cab.nb_dividers ?? 0;
           const usableW = W - 2 * T;
-          const gap = usableW / (totalDiv + 1);
+          const gap = usableW / ((totalDiv > 0 ? totalDiv : 1) + 1);
           panel.x = T + gap * (divIdx + 1);
           panel.y = T;
           panel.w = T; panel.h = H - 2 * T;
@@ -273,8 +454,8 @@ function buildCabinetPanels(pieces, cab) {
           break;
 
         case 'door': {
-          const totalDoors = cab.nb_doors || 1;
-          const doorW = (W - 2 * T) / totalDoors;
+          const totalDoors = cab.nb_doors ?? 0;
+          const doorW = (W - 2 * T) / (totalDoors > 0 ? totalDoors : 1);
           panel.x = T + doorW * doorIdx;
           panel.y = T;
           panel.w = doorW; panel.h = H - 2 * T;
@@ -283,8 +464,8 @@ function buildCabinetPanels(pieces, cab) {
         }
 
         case 'drawer_front': {
-          const totalDrawers = cab.nb_drawers || 1;
-          const drawerH = (H - 2 * T) / totalDrawers;
+          const totalDrawers = cab.nb_drawers ?? 0;
+          const drawerH = (H - 2 * T) / (totalDrawers > 0 ? totalDrawers : 1);
           panel.x = T;
           panel.y = T + drawerH * drawerIdx;
           panel.w = W - 2 * T; panel.h = drawerH;
@@ -306,7 +487,7 @@ function buildCabinetPanels(pieces, cab) {
 
 app.use((err, _req, res, _next) => {
   console.error('Unhandled:', err.message);
-  res.status(500).json({ error: 'server_error' });
+  res.status(500).json({ error: 'server_error', status: 500, detail: err.message || null });
 });
 
 const PORT = process.env.PORT || 3001;
