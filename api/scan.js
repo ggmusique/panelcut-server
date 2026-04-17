@@ -22,7 +22,7 @@ export default async function handler(req, res) {
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-3-5-sonnet-20241022",
         max_tokens: 4096,
         messages: [{
           role: "user",
@@ -113,7 +113,8 @@ RÈGLES STRICTES :
     let parsed;
     try {
       const clean = text.replace(/```json|```/g, "").trim();
-      parsed = JSON.parse(clean);
+      const match = clean.match(/{[\s\S]*}/);
+      parsed = JSON.parse(match ? match[0] : clean);
     } catch {
       return res.status(422).json({ error: "parse_error", raw: text });
     }

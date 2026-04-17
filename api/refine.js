@@ -1,22 +1,9 @@
 /**
  * api/refine.js — Relance Claude Vision sur un croquis annoté
- *
- * POST body: { image: string (base64), mediaType: string, prompt: string, context: object|null }
- * Response:  { pieces: [...], cabinet: {...} }  — même format que /api/scan
- *
- * Différence avec /api/scan :
- *  - Reçoit un prompt utilisateur enrichi (annotations + corrections textuelles)
- *  - Le contexte du scan initial est injecté pour que Claude corrige plutôt que réanalyse
- *  - Priorité explicite aux annotations visibles sur l'image
  */
 
 const REFINE_SYSTEM = `Tu es un expert menuisier-ébéniste et dessinateur industriel.
 Tu analyses un croquis de meuble ANNOTÉ avec des corrections de l'utilisateur.
-
-Les annotations colorées sur l'image sont des CORRECTIONS PRIORITAIRES :
-- Flèches cyan (↔) avec texte = cotes exactes à utiliser en priorité absolue
-- Texte vert (💬) = notes de correction
-- Traits orange (✏️) = modifications de structure
 
 RETOURNE UNIQUEMENT ce JSON valide, sans backticks, sans texte autour :
 
@@ -36,22 +23,18 @@ RETOURNE UNIQUEMENT ce JSON valide, sans backticks, sans texte autour :
     "nb_drawers": 0,
     "nb_dividers": 1,
     "modules": [],
-    "panels": [
-      {"role": "side", "name": "Côté G", "w": 58, "h": 220, "qty": 1, "x": 0, "y": 0, "z": 0}
-    ]
+    "panels": []
   },
   "confidence": 0.92,
-  "corrections_applied": ["Hauteur corrigée à 220 cm", "Profondeur ajustée à 58 cm"]
+  "corrections_applied": ["Hauteur corrigée à 220 cm"]
 }
 
 RÈGLES :
-- dimensions en cm, length = grande dimension, height = petite dimension
+- dimensions en cm
 - Si une annotation indique une cote, utilise-la EXACTEMENT
-- corrections_applied = liste des corrections prises en compte depuis les annotations
 - confidence entre 0.0 et 1.0`;
 
 export default async function handler(req, res) {
-  // CORS
   res.setHeader('Access-Control-Allow-Origin',  '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -66,23 +49,16 @@ export default async function handler(req, res) {
   const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
   if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'api_key_missing' });
 
-  // Construire le prompt utilisateur : contexte initial + corrections
   const contextSummary = context?.cabinet?.width
-    ? `Scan initial : ${context.cabinet.width}×${context.cabinet.height}×${context.cabinet.depth ?? '?'} cm, ` +
-      `${context.cabinet.nb_shelves ?? context.cabinet.modules?.length ?? '?'} tablettes, ` +
-      `${context.cabinet.nb_drawers ?? '?'} tiroirs.`
+    ? `Scan initial : ${context.cabinet.width}×${context.cabinet.height}×${context.cabinet.depth ?? '?'} cm.`
     : '';
 
   const userText = [
     'Voici le croquis ANNOTÉ avec les corrections de l\'utilisateur.',
-    '',
     contextSummary,
-    '',
     prompt || 'Analyse les annotations et retourne le JSON corrigé.',
-    '',
-    'PRIORITÉ ABSOLUE : utilise les cotes annotées en cyan sur l\'image — elles sont exactes.',
     'Retourne le JSON uniquement, sans texte autour.',
-  ].filter(Boolean).join('\n');
+  ].filter(Boolean).join('\n\n');
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -93,24 +69,14 @@ export default async function handler(req, res) {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model:      'claude-sonnet-4-20250514',
+        model:      'claude-3-5-sonnet-20241022',
         max_tokens: 4096,
         system:     REFINE_SYSTEM,
         messages: [{
           role: 'user',
           content: [
-            {
-              type:   'image',
-              source: {
-                type:       'base64',
-                media_type: mediaType || 'image/png',
-                data:       image,
-              },
-            },
-            {
-              type: 'text',
-              text: userText,
-            },
+            { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/png', data: image } },
+            { type: 'text',  text: userText },
           ],
         }],
       }),
@@ -127,14 +93,12 @@ export default async function handler(req, res) {
     let parsed;
     try {
       const clean = text.replace(/```json|```/g, '').trim();
-      // Extraire le JSON si du texte précède
-      const match = clean.match(/\{[\s\S]*\}/);
+      const match = clean.match(/{[\s\S]*}/);
       parsed = JSON.parse(match ? match[0] : clean);
     } catch {
       return res.status(422).json({ error: 'parse_error', raw: text });
     }
 
-    // Normaliser pieces
     const pieces = (parsed.pieces || [])
       .filter(p => p.length > 0 && p.height > 0)
       .map(p => ({
@@ -146,7 +110,6 @@ export default async function handler(req, res) {
       }))
       .filter(p => p.length > 0 && p.height > 0);
 
-    // Normaliser cabinet
     const rawCab = parsed.cabinet || {};
     const cabinet = {
       type:        rawCab.type        || 'autre',
@@ -175,8 +138,8 @@ export default async function handler(req, res) {
     res.json({
       pieces,
       cabinet,
-      confidence:           parsed.confidence           || null,
-      corrections_applied:  parsed.corrections_applied  || [],
+      confidence:          parsed.confidence          || null,
+      corrections_applied: parsed.corrections_applied || [],
     });
 
   } catch (err) {
